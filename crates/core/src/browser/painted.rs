@@ -880,11 +880,22 @@ fn buried_inert(dom: &dyn Dom, el: ElId, root: ElId) -> bool {
 /// stacks at 0, as an in-flow branch does in tree order. `None` for a
 /// `z-index` the capture did not record, or a number on a box that is not
 /// positioned (a flex or grid item stacks by it), which no sibling is known
-/// to cover.
+/// to cover. A box that opens a stacking context keeps the levels inside it
+/// there: the branch stacks at the box's own level. Where the capture cannot
+/// tell whether a box opens one ([`opens_stacking_context`]), a level read
+/// inside it is unknown too.
 fn branch_z(dom: &dyn Dom, el: ElId, branch: ElId) -> Option<f64> {
     let mut level: Option<f64> = None;
     let mut cur = Some(el);
     while let Some(n) = cur {
+        if n != el {
+            match super::visual::opens_stacking_context(dom, n) {
+                Some(true) => level = None,
+                Some(false) => {}
+                None if level.is_some_and(|v| v != 0.0) => return None,
+                None => {}
+            }
+        }
         if !is_positioned(dom, n) {
             let v = js::parse_float(js::trim(&dom.style(n, "zIndex")));
             if v.is_finite() && v != 0.0 {
@@ -916,15 +927,21 @@ fn branch_z(dom: &dyn Dom, el: ElId, branch: ElId) -> Option<f64> {
 /// Whether a sibling of `root` or of one of its ancestors covers it for
 /// good: positioned, filled with an opaque `background-color` (alpha 0.95 or
 /// more) at an effective opacity of 0.95 or more, its box holding `root`'s
-/// box within 1px, and stacked above the branch `el` paints in (a higher
-/// z-index, or the same one later in tree order). Only the siblings
-/// themselves are read, not their descendants; anything unmeasured or
-/// unrecorded covers nothing.
+/// box within 1px and what of `el`'s box shows ([`shown_band`]), and stacked
+/// above the branch `el` paints in (a higher z-index, or the same one later
+/// in tree order). Only the siblings themselves are read, not their
+/// descendants; anything unmeasured or unrecorded covers nothing.
 fn buried_by_an_opaque_sibling(dom: &dyn Dom, el: ElId, root: ElId) -> bool {
     let d = dom.rect(root);
     if !d.all_finite() || d.width <= 0.0 || d.height <= 0.0 {
         return false;
     }
+    let Some(shown) = shown_band(dom, el) else {
+        return false;
+    };
+    let holds = |r: &Rect, b: &Rect| {
+        r.left <= b.left + 1.0 && r.top <= b.top + 1.0 && r.right >= b.right - 1.0 && r.bottom >= b.bottom - 1.0
+    };
     let mut branch = root;
     while let Some(parent) = dom.parent(branch) {
         let Some(own) = branch_z(dom, el, branch) else {
@@ -954,13 +971,7 @@ fn buried_by_an_opaque_sibling(dom: &dyn Dom, el: ElId, root: ElId) -> bool {
             let opaque = super::element_checks::parse_rgb_or_any(&dom.style(sib, "backgroundColor"))
                 .is_some_and(|c| c.alpha_or_one() >= 0.95)
                 && effective_opacity_dom(dom, sib) >= 0.95;
-            if opaque
-                && r.all_finite()
-                && r.left <= d.left + 1.0
-                && r.top <= d.top + 1.0
-                && r.right >= d.right - 1.0
-                && r.bottom >= d.bottom - 1.0
-            {
+            if opaque && r.all_finite() && holds(&r, &d) && shown.as_ref().map_or(true, |b| holds(&r, b)) {
                 return true;
             }
         }
@@ -970,6 +981,37 @@ fn buried_by_an_opaque_sibling(dom: &dyn Dom, el: ElId, root: ElId) -> bool {
         branch = parent;
     }
     false
+}
+
+/// What of `el`'s box shows: its box cut, axis by axis, to every ancestor
+/// whose overflow clips it ([`clipping_ancestors`]). A clip is read at the
+/// ancestor's border box, a little past its padding box, so the band is
+/// never smaller than what shows. `None` when `el` is unmeasured; `Some(None)`
+/// when the clips leave nothing of it.
+fn shown_band(dom: &dyn Dom, el: ElId) -> Option<Option<Rect>> {
+    let r = dom.rect(el);
+    if !r.all_finite() {
+        return None;
+    }
+    let (mut left, mut top, mut right, mut bottom) = (r.left, r.top, r.right, r.bottom);
+    for c in clipping_ancestors(dom, el) {
+        let b = dom.rect(c);
+        if !b.all_finite() {
+            continue;
+        }
+        if clips(&crate::browser::text_geometry::overflow_x(dom, c)) {
+            left = js::math_max(left, b.left);
+            right = js::math_min(right, b.right);
+        }
+        if clips(&crate::browser::text_geometry::overflow_y(dom, c)) {
+            top = js::math_max(top, b.top);
+            bottom = js::math_min(bottom, b.bottom);
+        }
+    }
+    if right < left || bottom < top {
+        return Some(None);
+    }
+    Some(Some(Rect::from_xywh(left, top, right - left, bottom - top)))
 }
 
 /// The ancestors of `el`, below the body, whose overflow can clip it, by
@@ -3205,6 +3247,17 @@ mod tests {
         d.set_styles(el, RESOLVED_INITIAL);
     }
 
+    /// The computed values a browser reports for the stacking-context
+    /// properties [`branch_z`] reads when none is set.
+    const FLAT: &[(&str, &str)] = &[
+        ("isolation", "auto"),
+        ("mixBlendMode", "normal"),
+        ("clipPath", "none"),
+        ("maskImage", "none"),
+        ("webkitMaskImage", "none"),
+        ("opacity", "1"),
+    ];
+
     fn page() -> (FakeDom, ElId) {
         let mut d = FakeDom::new();
         let (html, body) = d.with_page();
@@ -3427,8 +3480,12 @@ mod tests {
         let (mut d, overlay, _, _, status) = build(true, true);
         d.set_style(overlay, "zIndex", "auto");
         assert_eq!(text(&d, status), None, "same level, overlay earlier");
-        // A bar the view fixes above the overlay is on screen.
+        // A bar the view fixes above the overlay is on screen, read through
+        // boxes that say they open no stacking context.
         let (mut d, _, wrap, _, _) = build(true, false);
+        d.set_styles(wrap, FLAT);
+        let app = d.parent(wrap).expect("app");
+        d.set_styles(app, FLAT);
         let bar = d.add(Some(wrap), "div");
         d.set_styles(bar, &[("position", "fixed"), ("zIndex", "50")]);
         d.set_rect(bar, 20.0, 70.0, 360.0, 40.0);
@@ -3445,6 +3502,70 @@ mod tests {
         let (mut d, _, wrap, _, status) = build(true, false);
         d.set_attr(wrap, "role", "dialog");
         assert_eq!(text(&d, status), Some(Unpainted::NotRendered), "in-flow dialog");
+    }
+
+    /// The cover must hold what of an inert view shows, not only the inert
+    /// box: a child an inert wrapper lets overflow past the cover is on
+    /// screen, while one the wrapper clips at the cover's edge is not. And a
+    /// `z-index` inside a box that opens its own stacking context stacks
+    /// only inside it: a child at `z-index: -2` in an inert `isolation:
+    /// isolate` wrapper paints at the wrapper's level, over a cover at -1.
+    #[test]
+    fn an_inert_view_is_buried_only_where_the_cover_holds_what_shows() {
+        // (overlay, wrapper, card, status): a 200px-tall app and its cover,
+        // over an inert wrapper as tall whose sidebar runs 300px.
+        let build = || {
+            let (mut d, body) = page();
+            let app = d.add(Some(body), "div");
+            d.set_styles(app, &[("position", "absolute"), ("zIndex", "auto")]);
+            d.set_styles(app, FLAT);
+            d.set_rect(app, 20.0, 70.0, 360.0, 200.0);
+            let wrap = d.add(Some(app), "div");
+            d.set_attr(wrap, "inert", "");
+            resolved(&mut d, wrap);
+            d.set_styles(wrap, FLAT);
+            d.set_rect(wrap, 20.0, 70.0, 360.0, 200.0);
+            let aside = d.add(Some(wrap), "aside");
+            d.set_styles(aside, FLAT);
+            d.set_rect(aside, 30.0, 80.0, 300.0, 300.0);
+            let card = d.add(Some(aside), "div");
+            d.set_rect(card, 47.0, 97.0, 266.0, 90.0);
+            d.add_text(card, "Workspace Amber holds three panes.");
+            let status = d.add(Some(aside), "div");
+            d.set_rect(status, 47.0, 300.0, 266.0, 44.0);
+            d.add_text(status, "Status text past the cover's edge.");
+            let overlay = d.add(Some(app), "main");
+            d.set_styles(overlay, &[("position", "absolute"), ("zIndex", "40"), ("backgroundColor", "rgb(255, 255, 255)"), ("opacity", "1")]);
+            d.set_rect(overlay, 20.0, 70.0, 360.0, 200.0);
+            (d, overlay, wrap, card, status)
+        };
+
+        // Visible overflow: the status below the cover is on screen; the
+        // card the cover holds is not.
+        let (d, _, _, card, status) = build();
+        assert_eq!(text(&d, status), None, "overflows past the cover");
+        assert_eq!(why(&d, status), None, "overflows past the cover");
+        assert_eq!(why(&d, card), Some(Unpainted::NotRendered), "held by the cover");
+
+        // The wrapper clips at the cover's edge: a card taller than the
+        // cover shows only the part the cover holds.
+        let (mut d, _, wrap, card, _) = build();
+        d.set_styles(wrap, &[("overflowX", "hidden"), ("overflowY", "hidden")]);
+        d.set_rect(card, 47.0, 97.0, 266.0, 260.0);
+        assert_eq!(why(&d, card), Some(Unpainted::NotRendered), "clipped at the cover");
+
+        // A child at -2 inside an isolated wrapper, over a cover at -1.
+        let (mut d, overlay, wrap, card, _) = build();
+        d.set_style(overlay, "zIndex", "-1");
+        let aside = d.parent(card).expect("aside");
+        d.set_styles(aside, &[("position", "absolute"), ("zIndex", "-2")]);
+        assert_eq!(why(&d, card), Some(Unpainted::NotRendered), "the wrapper opens no context");
+        d.set_style(wrap, "isolation", "isolate");
+        assert_eq!(why(&d, card), None, "isolated wrapper over the cover");
+        // A wrapper whose stacking the capture did not record leaves the
+        // child's level unknown, which nothing is known to cover.
+        d.set_style(wrap, "isolation", "");
+        assert_eq!(why(&d, card), None, "unrecorded isolation");
     }
 
     /// reachmcp.com (observations-1006 row 18): a logo chip 89% inside a
