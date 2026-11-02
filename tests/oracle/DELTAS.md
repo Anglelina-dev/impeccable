@@ -7376,3 +7376,31 @@ A relative file target given to `surface-brief` is now read from cwd and normali
 ## Recorded 2026-11-01: static media merge with main e89e3ada3 (#1079)
 
 Kept both branches' delta notes. Runtime source merged without conflicts. Direct comparison of all five aggregate reports preserves the findings, their order, stdout, and exit codes. Only stderr in `detect-dir-text-all-fixtures` and `detect-no-advisory-text` changes: main's #1220 now walks the two `next.config.mjs` files, so the regex-only count is 62 rather than 60 and the extension list includes `.mjs`. These two goldens were re-recorded after asserting that this exact stderr replacement is the only difference. Frozen function vectors are unchanged.
+
+
+## Recorded 2026-10-26: DESIGN.md sidecar content provenance (#846)
+
+The sidecar check uses a versioned SHA-256 fingerprint with CRLF normalized to
+LF. Timestamps no longer establish freshness. Sidecars without a supported
+fingerprint are unverified; only a valid fingerprint mismatch is stale.
+Each changed golden was reviewed: changes are limited to this finding, its
+message/count, and its throttle-cache key. Exit codes and source files are
+unchanged. Doctor does not silently certify an old sidecar.
+
+- Context cases: `context-full`, `context-full-oversized-design`,
+  `context-full-many-briefs`, `context-full-target-brief`,
+  `context-full-target-related`, `context-full-target-missing-file`,
+  `context-full-target-last-wins`, `context-legacy`,
+  `context-staleness-throttle`, `context-staleness-cache-env`,
+  `context-build-path-local-over-shared`, `context-build-path-invalid-ignored`.
+- Doctor cases: `doctor-full-text`, `doctor-full-json`,
+  `doctor-order-boot-and-deep`, `doctor-full-sidecar-stale`,
+  `doctor-legacy-json`, `doctor-legacy-text`, `doctor-legacy-fix`,
+  `doctor-legacy-fix-json`, `doctor-legacy-fix-twice`,
+  `doctor-legacy-fix-no-overwrite`, `doctor-fix-clean`,
+  `doctor-target-file`, `doctor-sidecar-schema-missing`.
+  The historical `doctor-full-sidecar-stale` fixture changes only mtime and has
+  no fingerprint, so it now correctly reports unverified.
+- Six new `design-sidecar-*` cases cover help, missing source, invalid target,
+  stamping, a timestamp-only checkout, and changed source with an old timestamp.
+  The last two prove current versus stale after a real stamp.
