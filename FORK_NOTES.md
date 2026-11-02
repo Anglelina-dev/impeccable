@@ -39,3 +39,22 @@ Ported with credit to the upstream PR authors (`mager`, `openwong2kim`) and main
 ## Branch
 
 Working branch: `cursor/fix-static-media-988-f428` (name kept for the first fix; also carries #846 and #950).
+
+
+## Push this branch to the GitHub fork
+
+Cloud Agents in this session cannot read `GITHUB_TOKEN` into the live VM
+(no linked environment), so GitHub pushes need to happen from your machine.
+
+From WSL, after cloning Origin:
+
+```bash
+origin repo clone anglelina/flawless-state
+cd flawless-state
+git checkout cursor/fix-static-media-988-f428
+export GITHUB_TOKEN=ghp_your_pat_here   # Contents: Read and write on Anglelina-dev/impeccable
+./scripts/push-to-github-fork.sh
+# or: ./scripts/push-to-github-fork.sh main
+```
+
+GitHub fork: https://github.com/Anglelina-dev/impeccable
